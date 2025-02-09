@@ -53,8 +53,6 @@ func init() {
 		Addr: "localhost:6379",
 	})
 
-	// Initialize task queue
-	// taskQueue = asynq.NewClient(asynq.RedisClientOpt{Addr: "localhost:6379"})
 }
 
 func createLoan(c *gin.Context) {
@@ -99,59 +97,46 @@ func getOutstanding(c *gin.Context) {
 	c.JSON(200, gin.H{"remaining_balance": loan.RemainingBalance})
 }
 
-// Background task to update Redis cache
-// func enqueueCacheUpdate(loanID uint, balance float64) {
-// 	taskPayload := fmt.Sprintf("%d:%f", loanID, balance)
-// 	task := asynq.NewTask("update_cache", []byte(taskPayload))
-// 	_, err := taskQueue.Enqueue(task)
-// 	if err != nil {
-// 		log.Println("Failed to enqueue cache update task:", err)
-// 	}
-// }
-
 // Make a payment with cache update using worker queue
 func makePayment(c *gin.Context) {
 	var loan Loan
 	id := c.Param("loan_id")
-	maxRetries := 3
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		err := db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Raw("SELECT * FROM loans WHERE id = ? FOR UPDATE", id).Scan(&loan).Error; err != nil {
-				c.JSON(404, gin.H{"error": "Loan not found"})
-				return err
-			}
-
-			var repayment Repayment
-			if err := tx.Where("loan_id = ? AND paid = ?", loan.ID, false).
-				Order("week_no asc").First(&repayment).Error; err != nil {
-				c.JSON(400, gin.H{"error": "No pending repayments"})
-				return err
-			}
-
-			repayment.Paid = true
-			if err := tx.Save(&repayment).Error; err != nil {
-				return err
-			}
-
-			loan.RemainingBalance -= loan.WeeklyPayment
-			if err := tx.Save(&loan).Error; err != nil {
-				return err
-			}
-
-			// Enqueue background cache update task
-			// enqueueCacheUpdate(loan.ID, loan.RemainingBalance)
-
-			return nil
-		})
-
-		if err == nil {
-			c.JSON(200, gin.H{
-				"message":           "Payment successful",
-				"remaining_balance": loan.RemainingBalance,
-			})
-			return
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Raw("SELECT * FROM loans WHERE id = ? FOR UPDATE", id).Scan(&loan).Error; err != nil {
+			c.JSON(404, gin.H{"error": "Loan not found"})
+			return err
 		}
+
+		var repayment Repayment
+		if err := tx.Where("loan_id = ? AND paid = ?", loan.ID, false).
+			Order("week_no asc").First(&repayment).Error; err != nil {
+			c.JSON(400, gin.H{"error": "No pending repayments"})
+			return err
+		}
+
+		repayment.Paid = true
+		if err := tx.Save(&repayment).Error; err != nil {
+			return err
+		}
+
+		loan.RemainingBalance -= loan.WeeklyPayment
+		if err := tx.Save(&loan).Error; err != nil {
+			return err
+		}
+
+		redisClient.Set(ctx, fmt.Sprintf("loan:%s:outstanding", id), fmt.Sprintf("%f", loan.RemainingBalance), 10*time.Minute)
+		redisClient.Del(ctx, fmt.Sprintf("loan:%s:delinquent", id))
+
+		return nil
+	})
+
+	if err == nil {
+		c.JSON(200, gin.H{
+			"message":           "Payment successful",
+			"remaining_balance": loan.RemainingBalance,
+		})
+		return
 	}
 
 	c.JSON(500, gin.H{"error": "Transaction failed after multiple retries"})
